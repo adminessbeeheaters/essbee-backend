@@ -1,10 +1,9 @@
 """Ess Bee Heaters API entry point - slim assembly of modular routers."""
 import logging
 from fastapi import FastAPI, APIRouter
-from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 
-from database import client, UPLOAD_DIR
+from database import client
 from seed import seed_if_empty
 from auth import router as auth_router
 from routes.public_routes import router as public_router
@@ -19,8 +18,8 @@ api_router.include_router(auth_router)
 api_router.include_router(admin_router)
 app.include_router(api_router)
 
-# Serve uploaded images
-app.mount("/api/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+# Note: /api/uploads/* is handled by a route inside admin_routes (with MongoDB fallback)
+# rather than StaticFiles, so images survive Render free-tier disk wipes.
 
 app.add_middleware(
     CORSMiddleware,
