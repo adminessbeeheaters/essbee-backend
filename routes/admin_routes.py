@@ -2,10 +2,12 @@
 gallery, company, site content, sections and image upload."""
 import shutil
 import uuid
+import base64
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
+from fastapi.responses import Response
 
 from database import db, serialize, UPLOAD_DIR
 from auth import verify_admin
@@ -21,19 +23,56 @@ from models import (
 router = APIRouter()
 
 
-# ============== Image Upload ==============
+# ============== Image Upload (MongoDB-backed for persistence on free hosting) ==============
 
 @router.post("/admin/upload")
 async def upload_image(file: UploadFile = File(...), email: str = Depends(verify_admin)):
-    """Upload an image; returns a permanent URL served from /api/uploads/<filename>."""
+    """Upload an image. Stores binary in MongoDB so it survives Render free-tier
+    restarts. Returns a permanent URL served from /api/uploads/<filename>."""
     ext = (file.filename or 'file').rsplit('.', 1)[-1].lower()
     if ext not in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'):
         raise HTTPException(status_code=400, detail='Only image files are allowed')
     fname = f"{uuid.uuid4().hex}.{ext}"
-    path = UPLOAD_DIR / fname
-    with open(path, 'wb') as f:
-        shutil.copyfileobj(file.file, f)
+    content = await file.read()
+    if len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail='Max image size is 8 MB')
+    # Persist to MongoDB
+    await db.uploaded_files.update_one(
+        {'filename': fname},
+        {'$set': {
+            'filename': fname,
+            'content_type': file.content_type or f'image/{ext}',
+            'data': base64.b64encode(content).decode('ascii'),
+            'size': len(content),
+            'uploaded_at': datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+    # Also write to disk for fast serving while the server is up
+    (UPLOAD_DIR / fname).write_bytes(content)
     return {"url": f"/api/uploads/{fname}", "filename": fname}
+
+
+@router.get("/uploads/{filename}")
+async def fetch_upload(filename: str):
+    """Serves an uploaded image. Falls back to MongoDB if not on disk
+    (happens after Render free-tier restarts wipe local files)."""
+    path = UPLOAD_DIR / filename
+    if path.exists():
+        ext = filename.rsplit('.', 1)[-1].lower()
+        mt = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+              'webp': 'image/webp', 'gif': 'image/gif', 'svg': 'image/svg+xml'}.get(ext, 'application/octet-stream')
+        return Response(content=path.read_bytes(), media_type=mt)
+    doc = await db.uploaded_files.find_one({'filename': filename})
+    if not doc:
+        raise HTTPException(status_code=404, detail='File not found')
+    data = base64.b64decode(doc['data'])
+    # Restore to disk for subsequent requests
+    try:
+        path.write_bytes(data)
+    except Exception:
+        pass
+    return Response(content=data, media_type=doc.get('content_type', 'application/octet-stream'))
 
 
 # ============== Enquiries ==============
